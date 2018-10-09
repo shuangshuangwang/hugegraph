@@ -29,7 +29,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
-import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import org.apache.commons.collections.CollectionUtils;
@@ -57,10 +56,9 @@ import com.baidu.hugegraph.backend.tx.GraphIndexTransaction.OptimizedType;
 import com.baidu.hugegraph.config.CoreOptions;
 import com.baidu.hugegraph.config.HugeConfig;
 import com.baidu.hugegraph.exception.LimitExceedException;
-import com.baidu.hugegraph.exception.NotFoundException;
 import com.baidu.hugegraph.iterator.ExtendableIterator;
 import com.baidu.hugegraph.iterator.FilterIterator;
-import com.baidu.hugegraph.iterator.FlatMapperFilterIterator;
+import com.baidu.hugegraph.iterator.FlatMapperIterator;
 import com.baidu.hugegraph.iterator.MapperIterator;
 import com.baidu.hugegraph.perf.PerfUtil.Watched;
 import com.baidu.hugegraph.schema.EdgeLabel;
@@ -285,23 +283,23 @@ public class GraphTransaction extends IndexableTransaction {
 
     @Override
     public Iterator<BackendEntry> query(Query query) {
+        if (!(query instanceof ConditionQuery)) {
+            return super.query(query);
+        }
+
         List<Query> queries = new ArrayList<>();
-        if (query instanceof ConditionQuery) {
-            for (ConditionQuery cq: ConditionQueryFlatten.flatten(
-                                    (ConditionQuery) query)) {
-                Query q = this.optimizeQuery(cq);
-                /*
-                 * NOTE: There are two possibilities for this query:
-                 * 1.sysprop-query, which would not be empty.
-                 * 2.index-query result(ids after optimize), which may be empty.
-                 */
-                if (!q.empty()) {
-                    // Return empty if there is no result after index-query
-                    queries.add(q);
-                }
+        for (ConditionQuery cq: ConditionQueryFlatten.flatten(
+                                (ConditionQuery) query)) {
+            Query q = this.optimizeQuery(cq);
+            /*
+             * NOTE: There are two possibilities for this query:
+             * 1.sysprop-query, which would not be empty.
+             * 2.index-query result(ids after optimization), which may be empty.
+             */
+            if (!q.empty()) {
+                // Return empty if there is no result after index-query
+                queries.add(q);
             }
-        } else {
-            queries.add(query);
         }
 
         ExtendableIterator<BackendEntry> rs = new ExtendableIterator<>();
@@ -405,9 +403,10 @@ public class GraphTransaction extends IndexableTransaction {
     }
 
     public Iterator<Vertex> queryVertices(Object... vertexIds) {
-        // NOTE: it will allow duplicated vertices if query by duplicated ids
-        List<Vertex> results = new ArrayList<>(vertexIds.length);
+        // NOTE: not allowed duplicated vertices if query by duplicated ids
+        Set<Vertex> vertices = InsertionOrderUtil.newSet();
 
+        IdQuery query = new IdQuery(HugeType.VERTEX);
         for (Object vertexId : vertexIds) {
             Vertex vertex;
             Id id = HugeVertex.getIdValue(vertexId);
@@ -416,22 +415,26 @@ public class GraphTransaction extends IndexableTransaction {
                 continue;
             } else if ((vertex = this.addedVertexes.get(id)) != null ||
                        (vertex = this.updatedVertexes.get(id)) != null) {
-                // Find in memory
-                results.add(vertex);
+                // Found from local tx
+                vertices.add(vertex);
             } else {
-                // Query from backend store
-                try {
-                    BackendEntry entry = this.get(HugeType.VERTEX, id);
-                    vertex = this.serializer.readVertex(this.graph(), entry);
-                } catch (NotFoundException ignored) {
-                    continue;
-                }
-                assert vertex != null;
-                results.add(vertex);
+                // Prepare query from backend store
+                query.query(id);
             }
         }
 
-        return results.iterator();
+        ExtendableIterator<Vertex> results = new ExtendableIterator<>();
+        results.extend(vertices.iterator());
+
+        if (!query.empty()) {
+            // Query from backend store
+            Iterator<HugeVertex> it = this.queryVerticesFromBackend(query);
+            @SuppressWarnings("unchecked")
+            Iterator<Vertex> r = (Iterator<Vertex>) (Iterator<?>) it;
+            results.extend(r);
+        }
+
+        return results;
     }
 
     public Iterator<Vertex> queryVertices() {
@@ -441,23 +444,9 @@ public class GraphTransaction extends IndexableTransaction {
 
     public Iterator<Vertex> queryVertices(Query query) {
         Iterator<HugeVertex> results = this.queryVerticesFromBackend(query);
-        @SuppressWarnings("unchecked")
-        Iterator<Vertex> r = (Iterator<Vertex>) joinTxVertices(query, results);
-        return r;
-    }
 
-    private Iterator<HugeVertex> queryVerticesFromBackend(Query query) {
-        assert query.resultType().isVertex();
-
-        Iterator<BackendEntry> entries = this.query(query);
-
-        Iterator<HugeVertex> results = new MapperIterator<>(entries, entry -> {
-            HugeVertex vertex = this.serializer.readVertex(graph(), entry);
-            assert vertex != null;
-            return vertex;
-        });
-
-        return new FilterIterator<>(results, vertex -> {
+        // Filter unused or incorrect records
+        results = new FilterIterator<>(results, vertex -> {
             assert vertex.schemaLabel() != VertexLabel.NONE;
             // Filter hidden results
             if (!query.showHidden() && Graph.Hidden.isHidden(vertex.label())) {
@@ -466,9 +455,26 @@ public class GraphTransaction extends IndexableTransaction {
             // Process results that query from left index or primary-key
             if (query.resultType().isVertex() &&
                 !filterResultFromIndexQuery(query, vertex)) {
+                // Only index query will come here
                 return false;
             }
             return true;
+        });
+
+        @SuppressWarnings("unchecked")
+        Iterator<Vertex> r = (Iterator<Vertex>) joinTxVertices(query, results);
+        return r;
+    }
+
+    protected Iterator<HugeVertex> queryVerticesFromBackend(Query query) {
+        assert query.resultType().isVertex();
+
+        Iterator<BackendEntry> entries = this.query(query);
+
+        return new MapperIterator<>(entries, entry -> {
+            HugeVertex vertex = this.serializer.readVertex(graph(), entry);
+            assert vertex != null;
+            return vertex;
         });
     }
 
@@ -518,9 +524,10 @@ public class GraphTransaction extends IndexableTransaction {
     }
 
     public Iterator<Edge> queryEdges(Object... edgeIds) {
-        // NOTE: it will allow duplicated edges if query by duplicated ids
-        List<Edge> results = new ArrayList<>(edgeIds.length);
+        // NOTE: not allowed duplicated edges if query by duplicated ids
+        Set<Edge> edges = InsertionOrderUtil.newSet();
 
+        IdQuery query = new IdQuery(HugeType.EDGE);
         for (Object edgeId : edgeIds) {
             Edge edge;
             Id id = HugeEdge.getIdValue(edgeId);
@@ -529,24 +536,26 @@ public class GraphTransaction extends IndexableTransaction {
                 continue;
             } else if ((edge = this.addedEdges.get(id)) != null ||
                        (edge = this.updatedEdges.get(id)) != null) {
-                // Find in memory
-                results.add(edge);
+                // Found from local tx
+                edges.add(edge);
             } else {
-                // Query from backend store
-                BackendEntry entry;
-                try {
-                    entry = this.get(HugeType.EDGE, id);
-                } catch (NotFoundException ignored) {
-                    continue;
-                }
-                HugeVertex vertex = this.serializer.readVertex(graph(), entry);
-                assert vertex != null;
-                assert vertex.getEdges().size() == 1;
-                results.addAll(vertex.getEdges());
+                // Prepare query from backend store
+                query.query(id);
             }
         }
 
-        return results.iterator();
+        ExtendableIterator<Edge> results = new ExtendableIterator<>();
+        results.extend(edges.iterator());
+
+        if (!query.empty()) {
+            // Query from backend store
+            Iterator<HugeEdge> it = this.queryEdgesFromBackend(query);
+            @SuppressWarnings("unchecked")
+            Iterator<Edge> r = (Iterator<Edge>) (Iterator<?>) it;
+            results.extend(r);
+        }
+
+        return results;
     }
 
     public Iterator<Edge> queryEdges() {
@@ -556,27 +565,9 @@ public class GraphTransaction extends IndexableTransaction {
 
     public Iterator<Edge> queryEdges(Query query) {
         Iterator<HugeEdge> results = this.queryEdgesFromBackend(query);
-        @SuppressWarnings("unchecked")
-        Iterator<Edge> r = (Iterator<Edge>) joinTxEdges(query, results,
-                                                        this.removedVertexes);
-        return r;
-    }
-
-    private Iterator<HugeEdge> queryEdgesFromBackend(Query query) {
-        assert query.resultType().isEdge();
-
-        Iterator<BackendEntry> entries = this.query(query);
-
-        Function<BackendEntry, Iterator<HugeEdge>> mapper = entry -> {
-            // Edges are in a vertex
-            HugeVertex vertex = this.serializer.readVertex(graph(), entry);
-            assert vertex != null;
-            // Copy to avoid ConcurrentModificationException when removing edge
-            return ImmutableList.copyOf(vertex.getEdges()).iterator();
-        };
 
         Set<Id> returnedEdges = new HashSet<>();
-        Function<HugeEdge, Boolean> filter = edge -> {
+        results = new FilterIterator<>(results, edge -> {
             // Filter hidden results
             if (!query.showHidden() && Graph.Hidden.isHidden(edge.label())) {
                 return false;
@@ -597,12 +588,32 @@ public class GraphTransaction extends IndexableTransaction {
                 returnedEdges.add(edge.id());
                 return true;
             } else {
-                LOG.debug("Results contains edge: {}", edge);
+                LOG.debug("Result contains duplicated edge: {}", edge);
                 return false;
             }
-        };
+        });
 
-        return new FlatMapperFilterIterator<>(entries, mapper, filter);
+        @SuppressWarnings("unchecked")
+        Iterator<Edge> r = (Iterator<Edge>) joinTxEdges(query, results,
+                                                        this.removedVertexes);
+        return r;
+    }
+
+    protected Iterator<HugeEdge> queryEdgesFromBackend(Query query) {
+        assert query.resultType().isEdge();
+
+        Iterator<BackendEntry> entries = this.query(query);
+
+        return new FlatMapperIterator<>(entries, entry -> {
+            // Edges are in a vertex
+            HugeVertex vertex = this.serializer.readVertex(graph(), entry);
+            assert vertex != null;
+            if (query.ids().size() == 1) {
+                assert vertex.getEdges().size() == 1;
+            }
+            // Copy to avoid ConcurrentModificationException when removing edge
+            return ImmutableList.copyOf(vertex.getEdges()).iterator();
+        });
     }
 
     @Watched(prefix = "graph")

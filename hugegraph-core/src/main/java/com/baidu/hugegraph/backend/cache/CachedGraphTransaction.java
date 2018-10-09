@@ -23,24 +23,24 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 
-import org.apache.tinkerpop.gremlin.structure.Edge;
-import org.apache.tinkerpop.gremlin.structure.Vertex;
-
 import com.baidu.hugegraph.HugeGraph;
 import com.baidu.hugegraph.backend.BackendException;
 import com.baidu.hugegraph.backend.cache.CachedBackendStore.QueryId;
 import com.baidu.hugegraph.backend.id.Id;
+import com.baidu.hugegraph.backend.query.ConditionQuery;
+import com.baidu.hugegraph.backend.query.ConditionQueryFlatten;
+import com.baidu.hugegraph.backend.query.IdQuery;
 import com.baidu.hugegraph.backend.query.Query;
 import com.baidu.hugegraph.backend.store.BackendStore;
 import com.baidu.hugegraph.backend.tx.GraphTransaction;
 import com.baidu.hugegraph.config.CoreOptions;
 import com.baidu.hugegraph.config.HugeConfig;
-import com.baidu.hugegraph.schema.EdgeLabel;
+import com.baidu.hugegraph.iterator.ExtendableIterator;
 import com.baidu.hugegraph.schema.IndexLabel;
 import com.baidu.hugegraph.structure.HugeEdge;
-import com.baidu.hugegraph.structure.HugeEdgeProperty;
 import com.baidu.hugegraph.structure.HugeVertex;
 import com.baidu.hugegraph.structure.HugeVertexProperty;
+import com.baidu.hugegraph.type.HugeType;
 import com.google.common.collect.ImmutableList;
 
 public class CachedGraphTransaction extends GraphTransaction {
@@ -72,46 +72,67 @@ public class CachedGraphTransaction extends GraphTransaction {
     }
 
     @Override
-    public Iterator<Vertex> queryVertices(Object... vertexIds) {
-        List<Vertex> vertices = new ArrayList<>(vertexIds.length);
-        for (Object vertexId : vertexIds) {
-            if (vertexId == null) {
-                continue;
+    public Iterator<HugeVertex> queryVerticesFromBackend(Query query) {
+        if (!query.ids().isEmpty() && query.conditions().isEmpty()) {
+            return this.queryVerticesByIds((IdQuery) query);
+        }
+        // just for debug
+        else if (query instanceof ConditionQuery){
+            ExtendableIterator<HugeVertex> rs = new ExtendableIterator<>();
+            for (ConditionQuery cq: ConditionQueryFlatten.flatten(
+                                    (ConditionQuery) query)) {
+                Query q = this.optimizeQuery(cq);
+                if (!q.ids().isEmpty()) {
+                    rs.extend(this.queryVerticesByIds((IdQuery) q));
+                } else if (!q.empty()) {
+                    rs.extend(super.queryVerticesFromBackend(q));
+                }
             }
-            Id vid = HugeVertex.getIdValue(vertexId);
-            Object v = this.verticesCache.getOrFetch(vid, id -> {
-                Iterator<Vertex> iterator = super.queryVertices(id);
-                return iterator.hasNext() ? iterator.next() : null;
-            });
-            if (v != null) {
-                vertices.add((Vertex) v);
+            return rs;
+        // just for debug
+        } else {
+            return super.queryVerticesFromBackend(query);
+        }
+    }
+
+    private Iterator<HugeVertex> queryVerticesByIds(IdQuery query) {
+        IdQuery newQuery = new IdQuery(HugeType.VERTEX, query);
+        List<HugeVertex> vertices = new ArrayList<>(query.ids().size());
+        for (Id vertexId : query.ids()) {
+            Object vertex = this.verticesCache.get(vertexId);
+            if (vertex != null) {
+                vertices.add((HugeVertex) vertex);
+            } else {
+                newQuery.query(vertexId);
+            }
+        }
+        if (vertices.isEmpty()) {
+            newQuery = query;
+        }
+        if (!newQuery.empty()) {
+            Iterator<HugeVertex> rs = super.queryVerticesFromBackend(newQuery);
+            while (rs.hasNext()) {
+                HugeVertex vertex = rs.next();
+                vertices.add(vertex);
+                this.verticesCache.update(vertex.id(), vertex);
             }
         }
         return vertices.iterator();
     }
 
     @Override
-    public Iterator<Vertex> queryVertices(Query query) {
-        if (!query.ids().isEmpty() && query.conditions().isEmpty()) {
-            return this.queryVertices(query.ids().toArray());
-        } else {
-            return super.queryVertices(query);
-        }
-    }
-
-    @Override
-    public Iterator<Edge> queryEdges(Query query) {
+    public Iterator<HugeEdge> queryEdgesFromBackend(Query query) {
         if (query.empty()) {
             // Query all edges, don't cache it
-            return super.queryEdges(query);
+            return super.queryEdgesFromBackend(query);
         }
 
         Id id = new QueryId(query);
         @SuppressWarnings("unchecked")
-        List<Edge> edges = (List<Edge>) this.edgesCache.get(id);
+        List<HugeEdge> edges = (List<HugeEdge>) this.edgesCache.get(id);
         if (edges == null) {
             // Iterator can't be cached, caching list instead
-            edges = ImmutableList.copyOf(super.queryEdges(query));
+            edges = ImmutableList.copyOf(super.queryEdgesFromBackend(query));
             if (edges.size() <= MAX_CACHE_EDGES_PER_QUERY) {
                 this.edgesCache.update(id, edges);
             }
@@ -140,66 +161,30 @@ public class CachedGraphTransaction extends GraphTransaction {
 
     @Override
     public <V> void addVertexProperty(HugeVertexProperty<V> prop) {
-        // Update vertex cache
-        this.verticesCache.invalidate(prop.element().id());
-
         super.addVertexProperty(prop);
+
+        // Update vertex cache
+        HugeVertex vertex = prop.element();
+        this.verticesCache.updateIfPresent(vertex.id(), vertex);
+
     }
 
     @Override
     public <V> void removeVertexProperty(HugeVertexProperty<V> prop) {
-        // Update vertex cache
-        this.verticesCache.invalidate(prop.element().id());
-
         super.removeVertexProperty(prop);
+
+        // Update vertex cache
+        HugeVertex vertex = prop.element();
+        this.verticesCache.updateIfPresent(vertex.id(), vertex);
     }
 
     @Override
-    public HugeEdge addEdge(HugeEdge edge) {
-        // TODO: Use a more precise strategy to update the edge cache
-        this.edgesCache.clear();
-
-        return super.addEdge(edge);
-    }
-
-    @Override
-    public void removeEdge(HugeEdge edge) {
-        // TODO: Use a more precise strategy to update the edge cache
-        this.edgesCache.clear();
-
-        super.removeEdge(edge);
-    }
-
-    @Override
-    public void removeEdges(EdgeLabel edgeLabel) {
-        super.removeEdges(edgeLabel);
-
-        // TODO: Use a more precise strategy to update the edge cache
-        this.edgesCache.clear();
-    }
-
-    @Override
-    public <V> void addEdgeProperty(HugeEdgeProperty<V> prop) {
-        // TODO: Use a more precise strategy to update the edge cache
-        this.edgesCache.clear();
-
-        super.addEdgeProperty(prop);
-    }
-
-    @Override
-    public <V> void removeEdgeProperty(HugeEdgeProperty<V> prop) {
-        // TODO: Use a more precise strategy to update the edge cache
-        this.edgesCache.clear();
-
-        super.removeEdgeProperty(prop);
-    }
-
-    @Override
-    public void removeIndex(IndexLabel indexLabel) {
-        // TODO: Use a more precise strategy to update the edge cache
-        this.edgesCache.clear();
-
-        super.removeIndex(indexLabel);
+    public void commit() throws BackendException {
+        if (!this.edgesInTx().isEmpty()) {
+            // TODO: Use a more precise strategy to update the edge cache
+            this.edgesCache.clear();
+        }
+        super.commit();
     }
 
     @Override
@@ -213,5 +198,13 @@ public class CachedGraphTransaction extends GraphTransaction {
         this.edgesCache.clear();
 
         super.rollback();
+    }
+
+    @Override
+    public void removeIndex(IndexLabel indexLabel) {
+        // TODO: Use a more precise strategy to update the edge cache
+        this.edgesCache.clear();
+
+        super.removeIndex(indexLabel);
     }
 }
