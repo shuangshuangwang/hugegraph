@@ -34,6 +34,7 @@ import com.baidu.hugegraph.backend.id.IdGenerator;
 import com.baidu.hugegraph.backend.query.Condition;
 import com.baidu.hugegraph.backend.query.Condition.Relation;
 import com.baidu.hugegraph.backend.query.ConditionQuery;
+import com.baidu.hugegraph.backend.query.Query;
 import com.baidu.hugegraph.backend.store.BackendEntry;
 import com.baidu.hugegraph.backend.store.BackendEntry.BackendColumn;
 import com.baidu.hugegraph.backend.store.hbase.HbaseSessions.RowIterator;
@@ -133,8 +134,8 @@ public class HbaseTables {
         }
 
         @Override
-        protected void parseRowColumns(Result row, BackendEntry entry)
-                                       throws IOException {
+        protected void parseRowColumns(Result row, BackendEntry entry,
+                                       Query query) throws IOException {
             byte[] key = row.getRow();
             // Collapse owner vertex id
             key = Arrays.copyOfRange(key, entry.id().length(), key.length);
@@ -194,6 +195,20 @@ public class HbaseTables {
 
         public SecondaryIndex(String store) {
             super(joinTableName(store, TABLE));
+        }
+
+        protected void parseRowColumns(Result row, BackendEntry entry,
+                                       Query query) throws IOException {
+            CellScanner cellScanner = row.cellScanner();
+            long num = query.offset() + query.limit();
+            for (long i = 0; i < num; i++) {
+                if (!cellScanner.advance()) {
+                    break;
+                }
+                Cell cell = cellScanner.current();
+                entry.columns(BackendColumn.of(CellUtil.cloneQualifier(cell),
+                                               CellUtil.cloneValue(cell)));
+            }
         }
     }
 
